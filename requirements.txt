@@ -1,0 +1,10 @@
+openai
+sounddevice
+numpy
+pystray
+pillow
+websocket-client
+onnx-asr[cpu,hub]
+customtkinter
+ctranslate2
+sentencepiece

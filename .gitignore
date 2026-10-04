@@ -1,0 +1,6 @@
+# личное: ключ OpenAI, статистика, лог
+config.json
+stats.json
+dictation.log*
+__pycache__/
+*.pyc
