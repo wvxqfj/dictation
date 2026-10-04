@@ -254,6 +254,19 @@ class Mic:
             self.sink = None
 
 
+def resampler(sink, src_rate, dst_rate):
+    """Обёртка над sink: PCM int16 из src_rate в dst_rate."""
+    if src_rate == dst_rate:
+        return sink
+
+    def push(pcm):
+        x = np.frombuffer(pcm, np.int16)
+        n = len(x) * dst_rate // src_rate
+        if n:
+            sink(np.interp(np.arange(n) * len(x) / n, np.arange(len(x)), x).astype(np.int16).tobytes())
+    return push
+
+
 # ---------------------------------------------------------------- Приложение
 
 class App:
@@ -263,6 +276,7 @@ class App:
         self.client = OpenAI(api_key=self.key) if self.key else None
         self.local = cfg["backend"] == "local"
         self.engine = local_asr.LocalEngine(cfg) if self.local else None
+        self.openai_stopgap_noted = False
         self.translator = None
         self.init_translator()
         self.llm = None
@@ -645,9 +659,15 @@ class App:
             log.exception("ui")
             self.notify(f"Не удалось открыть окно: {e}")
 
-    def take_session(self):
-        if self.local:
-            return local_asr.LocalSession(self.cfg, self.engine)
+    def local_pending(self):
+        """Локальная модель ещё качается/грузится или не загрузилась."""
+        return self.local and (not self.engine.ready.is_set() or self.engine.error is not None)
+
+    def take_session(self, via_openai):
+        if not via_openai:
+            s = local_asr.LocalSession(self.cfg, self.engine)
+            s.via_openai = False
+            return s
         with self.spare_lock:
             s, self.spare = self.spare, None
         if s and not s.usable(SPARE_MAX_AGE):
@@ -655,6 +675,7 @@ class App:
             s = None
         if s is None:
             s = RealtimeSession(self.cfg, self.key)
+        s.via_openai = True
         threading.Thread(target=self.refill_spare, daemon=True).start()
         return s
 
@@ -669,7 +690,7 @@ class App:
     def spare_keeper(self):
         while True:
             time.sleep(20)
-            if self.key and not self.local:
+            if self.key and (not self.local or self.local_pending()):
                 self.refill_spare()
 
     def start_recording(self, mode):
@@ -678,9 +699,17 @@ class App:
         if not self.local and not self.client:
             self.notify("Нет OpenAI API ключа — впишите его в config.json")
             return
-        if self.local and self.engine.error:
+        # пока локальная модель качается (или не загрузилась), а ключ есть — распознаём через OpenAI;
+        # как только модель готова, следующие записи снова идут локально
+        via_openai = not self.local or (self.local_pending() and self.client is not None)
+        if self.local and self.engine.error and not via_openai:
             self.notify(f"Локальная модель не загрузилась: {self.engine.error}")
             return
+        if self.local and via_openai and not self.openai_stopgap_noted:
+            self.openai_stopgap_noted = True
+            self.notify("Локальная модель ещё загружается — пока распознаю через OpenAI")
+        if self.local and via_openai:
+            log.info("локальная модель не готова — эта запись через OpenAI")
         if mode == "en" and self.translator:
             # запись не отменяем: перевод появится, когда модель догрузится, или напечатается как есть
             if self.translator.error:
@@ -688,10 +717,10 @@ class App:
             elif not self.translator.ready.is_set():
                 self.notify("Модель перевода ещё загружается — перевод появится чуть позже")
         self.mic.open()
-        s = self.take_session()
+        s = self.take_session(via_openai)
         s.mode = mode
         s.cleanup = self.make_cleanup()
-        if not self.local:
+        if via_openai:
             model = self.cfg["transcribe_model"]
             s.on_usage = lambda usage: self._transcribe_usage(model, usage)
         s.t_start, s.t_stop = time.time(), None
@@ -703,7 +732,7 @@ class App:
         s.begin(get_mode=lambda: s.mode, emit=w.type_text, translate=self.translate,
                 on_done=self.on_session_done)
         self.session = s
-        self.mic.attach(s.push)
+        self.mic.attach(resampler(s.push, self.mic.target, OPENAI_RATE) if via_openai else s.push)
         self.overlay.show(mode)
         log.info("запись начата (%s)", mode)
 
@@ -727,11 +756,11 @@ class App:
         try:
             live = getattr(s, "live", None)
             text = live.text if live else ""
-            if not self.local and not getattr(s, "usage_seen", True) and s.audio and typed_any:
+            if s.via_openai and not getattr(s, "usage_seen", True) and s.audio and typed_any:
                 # сервер не прислал токены — считаем по длительности отправленного звука
                 secs = sum(len(c) for c in s.audio) / 2 / OPENAI_RATE
                 self.stats.transcribe_seconds(self.cfg["transcribe_model"], secs)
-            if failed and not typed_any and self.local:
+            if failed and not typed_any and not s.via_openai:
                 self.notify("Не удалось распознать — подробности в логе")
             if failed and not typed_any and s.audio:
                 log.info("realtime не сработал — распознаю целиком")
