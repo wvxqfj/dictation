@@ -317,6 +317,8 @@ class SettingsWindow:
         root.minsize(720, 520)
         self._set_icon(root)
         root.protocol("WM_DELETE_WINDOW", self._hide)
+        root.bind_all("<Control-KeyPress>", self._ctrl_keys, add="+")
+        root.bind_all("<Button-3>", self._context_menu, add="+")
 
         self.period = "7"
         self.dirty = False
@@ -330,6 +332,33 @@ class SettingsWindow:
         root.after(100, self._poll)
         root.after(5000, self._tick)
         root.mainloop()
+
+    # В русской раскладке Tk не узнаёт Ctrl+V/C/X/A (keysym кириллический) — ловим по коду клавиши
+    CTRL_EVENTS = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+
+    def _ctrl_keys(self, e):
+        if e.keysym.lower() in ("v", "c", "x", "a"):
+            return None   # латинская раскладка — Tk справится сам
+        ev = self.CTRL_EVENTS.get(e.keycode)
+        if ev and e.widget.winfo_class() in ("Entry", "Text"):
+            e.widget.event_generate(ev)
+            return "break"
+        return None
+
+    def _context_menu(self, e):
+        w = e.widget
+        if w.winfo_class() not in ("Entry", "Text"):
+            return
+        import tkinter as tk
+        menu = tk.Menu(w, tearoff=0)
+        for label, ev in (("Вырезать", "<<Cut>>"), ("Копировать", "<<Copy>>"), ("Вставить", "<<Paste>>")):
+            def run(ev=ev):
+                w.focus_set()
+                w.event_generate(ev)
+                if ev != "<<Copy>>":
+                    self._mark_dirty()
+            menu.add_command(label=label, command=run)
+        menu.tk_popup(e.x_root, e.y_root)
 
     def _set_icon(self, root):
         try:
@@ -719,6 +748,8 @@ class SettingsWindow:
         self._field(sec, "openai_api_key", "API-ключ OpenAI", "secret")
 
         sec = self._section(scroll, 4, "Поведение", None)
+        self._field(sec, "mic_device", "Микрофон", "choice",
+                    hint="Подключили новый микрофон — перезапустите программу, чтобы он появился в списке.")
         self._field(sec, "keep_mic_open", "Держать микрофон открытым", "switch",
                     hint="Запись стартует мгновенно, но Windows всё время показывает значок микрофона.")
         self._field(sec, "add_trailing_space", "Пробел после текста", "switch")
@@ -774,7 +805,7 @@ class SettingsWindow:
             get = lambda: {v: k for k, v in labels.items()}.get(w.get())
             put = lambda v: w.set(labels.get(v, ""))
         elif kind == "choice":
-            opts = list(CHOICES[key])
+            opts = self.app.mic_choices() if key == "mic_device" else list(CHOICES[key])
             w = ctk.CTkOptionMenu(sec, values=[l for _, l in opts], width=340, font=self.font(13),
                                   dropdown_font=self.font(13), fg_color=CARD_2, button_color=CARD_2,
                                   button_hover_color=BORDER, text_color=TEXT, dropdown_fg_color=CARD,
@@ -827,12 +858,32 @@ class SettingsWindow:
             def put(v, w=w, state=state):
                 state["vk"] = v
                 w.configure(text=winapi.key_name(v), border_color=BORDER)
-        elif kind in ("number", "secret"):
-            w = ctk.CTkEntry(sec, width=120 if kind == "number" else 420, fg_color=CARD_2, text_color=TEXT,
-                             border_color=BORDER, font=self.font(13), show="•" if kind == "secret" else "")
+        elif kind == "number":
+            w = ctk.CTkEntry(sec, width=120, fg_color=CARD_2, text_color=TEXT,
+                             border_color=BORDER, font=self.font(13))
             w.bind("<KeyRelease>", lambda e: mark())
             get = lambda: w.get().strip()
             put = lambda v: (w.delete(0, "end"), w.insert(0, str(v)))
+        elif kind == "secret":
+            w = ctk.CTkFrame(sec, fg_color="transparent")
+            entry = ctk.CTkEntry(w, width=420, fg_color=CARD_2, text_color=TEXT, border_color=BORDER,
+                                 font=self.font(13), show="•")
+            entry.bind("<KeyRelease>", lambda e: mark())
+            entry.pack(side="left")
+
+            def paste(entry=entry):
+                try:
+                    text = self.root.clipboard_get().strip()
+                except Exception:
+                    return
+                entry.delete(0, "end")
+                entry.insert(0, text)
+                mark()
+            ctk.CTkButton(w, text="Вставить", width=90, fg_color=CARD_2, hover_color=BORDER, text_color=TEXT,
+                          border_width=1, border_color=BORDER, font=self.font(13),
+                          command=paste).pack(side="left", padx=(8, 0))
+            get = lambda: entry.get().strip()
+            put = lambda v: (entry.delete(0, "end"), entry.insert(0, str(v)))
         w.grid(row=r, column=1, sticky="w", padx=(0, 18), pady=(12, 0 if hint else 12))
         hint_lab = None
         if hint or kind == "secret":

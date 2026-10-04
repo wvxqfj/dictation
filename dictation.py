@@ -21,6 +21,14 @@ import threading
 import time
 import wave
 
+# pythonw.exe запускает без консоли: stdout/stderr = None, а прогресс-бары huggingface_hub (tqdm)
+# пишут в stderr и роняют скачивание моделей
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import numpy as np
 import sounddevice as sd
 import openai
@@ -59,6 +67,7 @@ DEFAULT_CONFIG = {
     "vad_silence_ms": 500,
     "noise_reduction": "near_field",
     "keep_mic_open": True,
+    "mic_device": "",            # микрофон по имени; пусто — микрофон Windows по умолчанию
     "hotkey_vk": w.VK_COPILOT,   # F23 (клавиша Copilot)
     "add_trailing_space": True,
     "overlay_position": "top",   # индикатор записи: "top" — под камерой, "bottom" — на панели задач
@@ -116,12 +125,46 @@ REST_MODEL = "gpt-4o-transcribe"   # для отката: потоковые м�
 
 # ---------------------------------------------------------------- Микрофон
 
+MIC_MAPPER = ("Sound Mapper", "Переназначение звуковых")   # виртуальное «устройство по умолчанию» MME
+
+
+def _mme_inputs():
+    """Микрофоны через MME — с теми же именами, что в параметрах звука Windows."""
+    try:
+        mme = next(i for i, h in enumerate(sd.query_hostapis()) if h["name"] == "MME")
+    except StopIteration:
+        return []
+    return [(i, d["name"]) for i, d in enumerate(sd.query_devices())
+            if d["hostapi"] == mme and d["max_input_channels"] > 0
+            and not any(m in d["name"] for m in MIC_MAPPER)]
+
+
+def list_mics():
+    names = []
+    for _, name in _mme_inputs():
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def default_mic_name():
+    try:
+        return sd.query_devices(kind="input")["name"]
+    except Exception:
+        return ""
+
+
+def find_mic(name):
+    return next((i for i, n in _mme_inputs() if n == name), None) if name else None
+
+
 class Mic:
     """Поток с микрофона. Открытие на этом ноутбуке занимает ~0.5 с, поэтому по умолчанию
     держим его открытым и просто не отправляем звук, пока клавиша не нажата."""
 
-    def __init__(self, on_level, target_rate):
+    def __init__(self, on_level, target_rate, device_name=""):
         self.on_level = on_level
+        self.device_name = device_name
         self.stream = None
         self.target = target_rate
         self.rate = target_rate
@@ -133,16 +176,19 @@ class Mic:
     def open(self):
         if self.stream:
             return
+        device = find_mic(self.device_name)
+        if self.device_name and device is None:
+            log.warning("микрофон «%s» не найден, беру микрофон Windows по умолчанию", self.device_name)
         try:
             self.rate = self.target
-            self.stream = sd.InputStream(samplerate=self.rate, channels=1, dtype="int16",
+            self.stream = sd.InputStream(device=device, samplerate=self.rate, channels=1, dtype="int16",
                                          blocksize=self.rate // 50, callback=self._cb)
         except Exception:
-            self.rate = int(sd.query_devices(kind="input")["default_samplerate"])
-            self.stream = sd.InputStream(samplerate=self.rate, channels=1, dtype="int16",
+            self.rate = int(sd.query_devices(device, "input")["default_samplerate"])
+            self.stream = sd.InputStream(device=device, samplerate=self.rate, channels=1, dtype="int16",
                                          blocksize=self.rate // 50, callback=self._cb)
         self.stream.start()
-        log.info("микрофон открыт (%d Гц)", self.rate)
+        log.info("микрофон открыт: %s (%d Гц)", sd.query_devices(device, "input")["name"], self.rate)
 
     def close(self):
         if self.stream:
@@ -158,6 +204,19 @@ class Mic:
         self.close()
         with self.lock:
             self.target = rate
+            self.preroll.clear()
+            self.preroll_len = 0
+        if was_open:
+            self.open()
+
+    def set_device(self, name):
+        """Сменить микрофон; открытый поток переоткрывается."""
+        if name == self.device_name:
+            return
+        was_open = self.stream is not None
+        self.close()
+        with self.lock:
+            self.device_name = name
             self.preroll.clear()
             self.preroll_len = 0
         if was_open:
@@ -211,7 +270,8 @@ class App:
         self.online = local_llm.Online()
         self.init_llm()
         self.overlay = Overlay(lambda: self.cfg["overlay_position"])
-        self.mic = Mic(self.overlay.set_level, local_asr.SAMPLE_RATE if self.local else OPENAI_RATE)
+        self.mic = Mic(self.overlay.set_level, local_asr.SAMPLE_RATE if self.local else OPENAI_RATE,
+                       cfg["mic_device"])
         self.events = queue.Queue()
         self.icon = None
         self.main_tid = None
@@ -537,6 +597,8 @@ class App:
             self.init_translator()
         if any(k in clean for k in ("cleanup", "cleanup_engine", "local_cleanup_model", "openai_api_key")):
             self.init_llm()
+        if "mic_device" in clean:
+            self.mic.set_device(self.cfg["mic_device"])
         if "keep_mic_open" in clean:
             if self.cfg["keep_mic_open"]:
                 self.mic.open()
@@ -558,6 +620,12 @@ class App:
         if self.icon:
             self.icon.update_menu()
         return {"ok": True, "restart": restart}
+
+    def mic_choices(self):
+        """Варианты для окна настроек: (значение для config.json, подпись)."""
+        default = default_mic_name()
+        return [("", f"Как в Windows ({default})" if default else "Как в Windows")] + \
+            [(n, n) for n in list_mics()]
 
     def restart(self):
         """Новый экземпляр запускается после того, как мы отпустим мьютекс."""
