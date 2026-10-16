@@ -100,6 +100,7 @@ class LocalSession:
         self.audio_q = queue.Queue()
         self.cleanup = None                # задаёт App: функция правки текста или None
         self.can_edit = lambda: True
+        self.prior = None                  # задаёт App: () -> текст перед курсором
 
     def usable(self, max_age):
         return not self.started
@@ -127,7 +128,7 @@ class LocalSession:
         self.en = self.get_mode() == "en"
         self.retranslate = self.en and self.cfg.get("translate_engine") == "local"
         # живая правка — для русского текста, английский она не трогает
-        self.live = LiveText(None if self.en else self.cleanup, self.can_edit)
+        self.live = LiveText(None if self.en else self.cleanup, self.can_edit, self.prior)
         tr = None
         if self.retranslate or (self.streaming and self.en):
             self.tr_q = queue.Queue()
@@ -270,8 +271,8 @@ class LocalSession:
             src_done += src
             out_done += (" " if out_done and out and out[0] not in CLAUSE_END else "") + out
             if out:
-                if self.live.typed_any and out[0] not in CLAUSE_END:
-                    out = " " + out
+                if out[0] not in CLAUSE_END:
+                    out = self.live.lead() + out
                 self.live.append(out, last, editable=False)
 
     def _retranslator(self):

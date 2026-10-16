@@ -3,6 +3,7 @@
 
   Copilot (держать)                     -> диктовка на языке речи, текст печатается по ходу
   Copilot коротко, затем сразу держать  -> диктовка с переводом на английский
+  Copilot коротко (текст выделен)       -> меню: переписать выделенное короче / длиннее / официальнее…
 
 Клавиша Copilot на Windows 11 отправляет Win+Shift+F23, поэтому перехватываем F23.
 Другую клавишу можно назначить в окне настроек (hotkey_vk).
@@ -40,8 +41,11 @@ import live_edit
 import local_llm
 import local_asr
 import local_translate
+import rewrite
+import rewrite_menu
 import settings_window
 import stats
+import text_context
 from realtime import SAMPLE_RATE as OPENAI_RATE, RealtimeSession, is_live
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +90,9 @@ TAP_GAP = 0.5             # сколько после тапа ждать уде
 WIN_SHIFT_GRACE = 0.4     # после отпускания Copilot ещё столько глушим её Win/Shift
 COPILOT_MODS = (0x5B, 0xA0)  # LWin, LShift — их клавиша Copilot шлёт вместе с F23
 CAPTURE_TIMEOUT = 10      # сколько окно настроек ждёт нажатия новой клавиши диктовки
+REWRITE_TIMEOUT = 30      # сколько ждать OpenAI при переписывании выделенного текста
+PRIOR_WAIT = 0.4          # сколько первая фраза ждёт текста перед курсором от UI Automation
+VK_ESCAPE = 0x1B
 
 log = logging.getLogger("dictation")
 
@@ -292,12 +299,18 @@ class App:
         self.mutex = None
         self.stats = stats.Stats(cfg)
         self.ui = None
+        self.uia = text_context.Uia()
+        self.menu = rewrite_menu.RewriteMenu(self.on_rewrite_pick)
+        self.rewrite_job = None
+        self.last_typed = None        # что напечатала прошлая диктовка: окно, хвост текста и когда
 
         # состояние клавиши (меняется только в хуке)
         self.key_down = False
         self.press_id = 0
         self.mods_quiet_until = 0.0   # до этого момента Win/Shift от Copilot не пропускаем в систему
         self.trace = []               # последовательность событий одного нажатия Copilot — для лога
+        self.tap_ignore = 0           # это нажатие закрыло меню переписывания — меню снова не открываем
+        self.esc_swallowed = False
         self.capture = None           # окно настроек ловит новую клавишу диктовки
         # тап или удержание (меняется только в потоке-контроллере)
         self.pending_press = None   # нажатие, которое ещё может оказаться тапом
@@ -353,12 +366,25 @@ class App:
         if vk != hot:
             if down:
                 self.user_input_at = time.time()
+                if self.menu.visible and not (hot == w.VK_COPILOT and vk in COPILOT_MODS):
+                    # любая клавиша закрывает меню переписывания; Esc при этом до окна не доходит.
+                    # Win/Shift не в счёт: клавиша Copilot шлёт их перед F23 — её нажатие закроет меню само
+                    self.menu.hide()
+                    if vk == VK_ESCAPE:
+                        self.esc_swallowed = True
+                        return True
+            elif vk == VK_ESCAPE and self.esc_swallowed:
+                self.esc_swallowed = False
+                return True
             return False
 
         if down and not self.key_down:
             self.key_down = True
             self.press_id += 1
             self.trace = ["F+"]
+            if self.menu.visible:
+                self.menu.hide()
+                self.tap_ignore = self.press_id
             self.events.put(("press", self.press_id, time.time()))
             if hot == w.VK_COPILOT:
                 # Win+Shift пришли до F23 и система их уже видит — отпускаем их
@@ -390,6 +416,8 @@ class App:
                 ms = ctypes.cast(l_param, ctypes.POINTER(w.MSLLHOOKSTRUCT)).contents
                 if not ms.flags & w.LLMHF_INJECTED:
                     self.user_input_at = time.time()
+                    if self.menu.visible and not self.menu.contains(ms.pt.x, ms.pt.y):
+                        self.menu.hide()   # щелчок мимо меню переписывания закрывает его
             return w.user32.CallNextHookEx(None, n_code, w_param, l_param)
 
         self._proc = w.HOOKPROC(proc)  # держим ссылку, иначе GC
@@ -416,6 +444,12 @@ class App:
                         self.start_recording("native")
                 elif kind == "up":
                     self.on_up(ev[1], ev[2])
+                elif kind == "tap":
+                    # одиночный тап (за ним не последовало удержание) — меню переписывания выделенного
+                    if self.last_tap_up == ev[1] and not self.session:
+                        self.last_tap_up = 0.0
+                        self.release_mods()
+                        threading.Thread(target=self.open_rewrite_menu, daemon=True).start()
                 elif kind == "release":
                     self.release_mods()
                 elif kind == "unstick":
@@ -459,6 +493,8 @@ class App:
         if self.pending_press == pid:
             self.pending_press = None
             self.last_tap_up = t
+            if pid != self.tap_ignore:
+                threading.Timer(TAP_GAP, lambda: self.events.put(("tap", t))).start()
         else:
             self.stop_recording()
 
@@ -727,6 +763,8 @@ class App:
         hwnd, t0 = w.user32.GetForegroundWindow(), time.time()
         s.can_edit = lambda: (w.user32.GetForegroundWindow() == hwnd
                               and self.user_input_at < t0)
+        s.hwnd = hwnd
+        s.prior = self.prior_text(hwnd)
         with self.active_lock:
             self.active += 1
         s.begin(get_mode=lambda: s.mode, emit=w.type_text, translate=self.translate,
@@ -756,6 +794,11 @@ class App:
         try:
             live = getattr(s, "live", None)
             text = live.text if live else ""
+            if live:
+                # следующая диктовка в этом же месте продолжит этот текст (если UI Automation в окне нет)
+                trail = " " if typed_any and self.cfg["add_trailing_space"] else ""
+                self.last_typed = {"hwnd": getattr(s, "hwnd", None), "t": time.time(),
+                                   "text": (live.screen + trail)[-text_context.BEFORE_CHARS:]}
             if s.via_openai and not getattr(s, "usage_seen", True) and s.audio and typed_any:
                 # сервер не прислал токены — считаем по длительности отправленного звука
                 secs = sum(len(c) for c in s.audio) / 2 / OPENAI_RATE
@@ -764,6 +807,7 @@ class App:
                 self.notify("Не удалось распознать — подробности в логе")
             if failed and not typed_any and s.audio:
                 log.info("realtime не сработал — распознаю целиком")
+                self.last_typed = None
                 text = self.fallback(b"".join(s.audio), s.mode)
         except Exception as e:
             log.exception("fallback")
@@ -847,6 +891,94 @@ class App:
         log.info("перевод: %s -> %s", text, out)
         return out
 
+    # --- что вокруг курсора
+
+    def prior_text(self, hwnd):
+        """Функция для сессии: текст, который стоял перед курсором, когда зажали клавишу. Читаем через
+        UI Automation (запрос уходит сразу, пока ничего не напечатано); если окно её не поддерживает —
+        берём то, что напечатала прошлая диктовка, если с тех пор в окне ничего не нажимали."""
+        caret = self.uia.caret()
+        m = self.last_typed
+        memory = m["text"] if m and m["hwnd"] == hwnd and self.user_input_at < m["t"] else None
+
+        def prior():
+            info = caret(PRIOR_WAIT)
+            return info["before"] if info is not None else memory
+        return prior
+
+    # --- переписывание выделенного текста
+
+    def open_rewrite_menu(self):
+        hwnd = w.user32.GetForegroundWindow()
+        if not hwnd or hwnd == self.menu.hwnd or text_context.is_console(hwnd):
+            return
+        t0 = time.time()
+        info = self.uia.caret()(1.0)
+        if info is not None:
+            if info["editable"] is False:
+                return   # текст только для чтения — заменить его нечем
+            text = info["selection"]
+        else:
+            # UI Automation в этом окне нет — выделение узнаём копированием
+            text = text_context.copy_selection(self.menu.hwnd)
+        if not text or not text.strip():
+            return
+        if w.user32.GetForegroundWindow() != hwnd or self.user_input_at > t0:
+            return
+        job = {"text": text, "hwnd": hwnd}
+        self.rewrite_job = job
+        job["token"] = self.menu.show(info and info.get("rect"), hwnd)
+        log.info("меню переписывания: выделено %d знаков", len(text))
+
+    def on_rewrite_pick(self, token, kind):
+        threading.Thread(target=self.do_rewrite, args=(token, kind), daemon=True).start()
+
+    def do_rewrite(self, token, kind):
+        job = self.rewrite_job
+        if not job or job["token"] != token:
+            return
+        t_pick = time.time()
+        src = job["text"].replace("\r\n", "\n").replace("\r", "\n")
+        try:
+            out = rewrite.keep_edges(src, self.rewrite_text(kind, src.strip()))
+        except Exception as e:
+            log.warning("переписать (%s) не удалось: %s", kind, e)
+            self.menu.hide(token)
+            self.notify(f"Не удалось переписать: {e}")
+            return
+        if not self.menu.active(token):
+            log.info("переписывание отменено: меню закрыли")
+            return
+        self.menu.hide(token)
+        if w.user32.GetForegroundWindow() != job["hwnd"] or self.user_input_at > t_pick:
+            self.notify("Текст не заменён: пока он переписывался, вы переключились или что-то нажали")
+            return
+        if "\n" in out.strip():
+            text_context.paste_text(self.menu.hwnd, out)   # с переносами строк — через буфер обмена
+        else:
+            w.type_text(out)
+        self.last_typed = None
+        log.info("переписано (%s) за %.1fs: %d -> %d знаков", rewrite.LABELS[kind], time.time() - t_pick,
+                 len(src), len(out))
+
+    def rewrite_text(self, kind, text):
+        """Где переписывать — как с живой правкой: OpenAI, а без интернета (или если так выбрано) — локально."""
+        engine = self.cfg["cleanup_engine"]
+        if self.client and engine != "local" and (engine == "openai" or self.online()):
+            if len(text) > rewrite.MAX_CHARS_REMOTE:
+                raise RuntimeError(f"выделено больше {rewrite.MAX_CHARS_REMOTE} знаков")
+            try:
+                return rewrite.remote(
+                    self.client.with_options(timeout=REWRITE_TIMEOUT, max_retries=0), self.cfg["cleanup_model"],
+                    kind, text, on_usage=lambda model, usage: self.stats.chat_usage("rewrite", model, usage))
+            except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                if engine == "openai":
+                    raise
+                self.online.lost(e)
+        if len(text) > rewrite.MAX_CHARS_LOCAL:
+            raise RuntimeError(f"локальная модель переписывает до {rewrite.MAX_CHARS_LOCAL} знаков за раз")
+        return rewrite.local(self.ensure_llm(), kind, text)
+
     # --- трей
 
     def make_image(self):
@@ -875,6 +1007,8 @@ class App:
             pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} (держать) — диктовка",
                              None, enabled=False),
             pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} коротко + держать — на английский",
+                             None, enabled=False),
+            pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} коротко — переписать выделенное",
                              None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda item: f"Локально ({self.cfg['local_model']})",
@@ -949,6 +1083,7 @@ def main():
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("comtypes").setLevel(logging.WARNING)
 
     mutex = None
     for attempt in range(20):

@@ -148,7 +148,7 @@ class LocalLLM:
             self.error = e
             self.ready.set()
 
-    def chat(self, messages, max_tokens=400, wait=120):
+    def chat(self, messages, max_tokens=400, wait=120, timeout=30):
         if not self.ready.wait(wait):
             raise RuntimeError("локальная модель правки ещё загружается")
         if self.error:
@@ -158,7 +158,7 @@ class LocalLLM:
                 "chat_template_kwargs": {"enable_thinking": False}}
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
                                      json.dumps(body).encode(), {"Content-Type": "application/json"})
-        with _local.open(req, timeout=30) as r:
+        with _local.open(req, timeout=timeout) as r:
             return json.load(r)["choices"][0]["message"]["content"] or ""
 
     def close(self):

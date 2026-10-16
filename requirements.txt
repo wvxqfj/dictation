@@ -8,3 +8,4 @@ onnx-asr[cpu,hub]
 customtkinter
 ctranslate2
 sentencepiece
+comtypes

@@ -26,7 +26,7 @@ PRICES = {
     "gpt-4o-mini":  {"input": 0.15, "cached": 0.075, "output": 0.60},
 }
 
-KINDS = ("transcribe", "cleanup", "translate")
+KINDS = ("transcribe", "cleanup", "translate", "rewrite")
 
 
 def _empty_day():

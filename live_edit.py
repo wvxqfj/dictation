@@ -12,6 +12,9 @@ import winapi as w
 log = logging.getLogger("dictation")
 
 CONTEXT_CHARS = 600     # сколько уже готового текста показывать модели для контекста
+PRIOR_CONTEXT_CHARS = 300   # из них — текста, который стоял перед курсором до диктовки
+JOIN_MAX_CHARS = 250    # недоговорённое предложение перед курсором длиннее — берём только его конец
+JOIN_PUNCT = ".,!?…:;"
 KEEP_SENTENCES = 2      # сколько последних предложений остаются редактируемыми
 MAX_TAIL_CHARS = 300    # длиннее — старые предложения «замораживаются»
 # защита от «сочинения» вместо правки: сколько новых слов (которых не было в речи) можно добавить
@@ -146,11 +149,20 @@ def make_cleanup(client, model, on_usage=None):
 
 
 class LiveText:
-    """Текст одной сессии диктовки на экране: frozen (уже не трогаем) + tail (можно править)."""
+    """Текст одной сессии диктовки на экране: frozen (уже не трогаем) + tail (можно править).
 
-    def __init__(self, cleanup, can_edit):
+    prior() — текст, который уже стоял перед курсором, когда зажали клавишу (прошлая диктовка в этом
+    же поле или напечатанное руками). По нему ставится пробел на стыке, а если там недоговорённое
+    предложение, правка решает, продолжает ли его новая речь (тогда с маленькой буквы) или начинает
+    новое (тогда прошлому предложению возвращается точка)."""
+
+    def __init__(self, cleanup, can_edit, prior=None):
         self.cleanup = cleanup          # None — без правки, просто печать
         self.can_edit = can_edit        # False, если пользователь щёлкнул/нажал клавишу/сменил окно
+        self.prior = prior
+        self.before = ""                # текст перед курсором до начала диктовки
+        self.pre_ws = 0                 # сколько пробелов в его конце (их можно стереть, ставя точку)
+        self.join = ""                  # его недоговорённое предложение — для правки стыка
         self.cond = threading.Condition()
         self.frozen = ""
         self.tail = ""
@@ -170,12 +182,40 @@ class LiveText:
         with self.cond:
             return self.frozen + self.tail
 
+    @property
+    def screen(self):
+        """Хвост текста на экране до курсора: то, что стояло раньше, и надиктованное."""
+        with self.cond:
+            return self.before + self.frozen + self.tail
+
+    def _load_prior(self):
+        if self.prior is None:
+            return
+        prior, self.prior = self.prior, None
+        try:
+            before = (prior() or "").replace("\r", "")
+        except Exception:
+            log.exception("текст перед курсором")
+            return
+        self.before = before
+        self.pre_ws = len(before) - len(before.rstrip(" \t"))
+        self.join = open_sentence(before) if self.cleanup else ""
+        if before.strip():
+            log.info("перед курсором: %r", before[-80:])
+
+    def lead(self):
+        """Пробел перед очередным куском, если на экране перед курсором не пробел."""
+        with self.cond:
+            self._load_prior()
+            last = (self.frozen + self.tail)[-1:] or self.before[-1:]
+            return " " if last and not last.isspace() and last not in "([{«„" else ""
+
     def add(self, text, editable=True):
         text = w.clean_text(text).strip()
         if not text:
             return
         with self.cond:
-            piece = (" " if self.typed_any else "") + text
+            piece = self.lead() + text
             w.type_text(piece)
             self.typed_any = True
             if editable and self.cleanup:
@@ -192,6 +232,7 @@ class LiveText:
         if not chunk:
             return
         with self.cond:
+            self._load_prior()
             w.type_text(chunk)
             self.typed_any = True
             if editable and self.cleanup:
@@ -211,7 +252,7 @@ class LiveText:
             if not self.cur and not text:
                 return
             if not self.cur:
-                self.cur_lead = " " if self.typed_any else ""
+                self.cur_lead = self.lead()
             target = (self.cur_lead + text) if text else ""
             cur = self.cur
             if target.startswith(cur):
@@ -287,19 +328,34 @@ class LiveText:
                     self.cond.wait()
                 if self.closed:
                     return
-                snapshot, context = self.tail, self.frozen[-CONTEXT_CHARS:]
+                snapshot = self.tail
+                context = (self.before[-PRIOR_CONTEXT_CHARS:] + self.frozen)[-CONTEXT_CHARS:]
                 if not self.whole:
                     # фраза ещё идёт — правим только законченные предложения
                     snapshot = snapshot[:_sentence_cut(snapshot)]
                     if len(snapshot) <= self.checked:
                         self.dirty = False
                         continue
+                # первая правка после недоговорённого предложения перед курсором: правим их вместе,
+                # чтобы модель решила, что на стыке — продолжение или точка
+                join = self.join if not self.frozen else ""
                 self.dirty = False
                 self.checked = len(snapshot)
                 self.busy = True
             try:
                 t0 = time.time()
-                cleaned = self.cleanup(context.strip(), snapshot.strip())
+                if join:
+                    ctx = self.before[:len(self.before.rstrip(" \t")) - len(join)][-PRIOR_CONTEXT_CHARS:]
+                    whole = self.cleanup(ctx.strip(), f"{join} {snapshot.strip()}")
+                    why = _not_an_edit(f"{join} {snapshot.strip()}", w.clean_text(whole))
+                    cleaned = None if why else _split_join(join, snapshot.strip(), w.clean_text(whole))
+                    if cleaned is None:
+                        log.info("стык с прошлым текстом не разобран (%s): %r -> %r", why or "не совпало",
+                                 join[-40:] + " | " + snapshot.strip()[:40], whole)
+                        cleaned = self.cleanup(context.strip(), snapshot.strip())
+                        join = ""
+                else:
+                    cleaned = self.cleanup(context.strip(), snapshot.strip())
                 dt = time.time() - t0
             except Exception as e:
                 log.warning("правка не удалась: %s", e)
@@ -307,35 +363,44 @@ class LiveText:
             with self.cond:
                 self.busy = False
                 if cleaned is not None and not self.closed:
-                    self._apply(snapshot, w.clean_text(cleaned), dt)
+                    if self._apply(snapshot, w.clean_text(cleaned), dt, join=bool(join)) and join:
+                        self.join = ""
                 self.cond.notify_all()
 
-    def _apply(self, snapshot, cleaned, dt):
+    def _apply(self, snapshot, cleaned, dt, join=False):
         src = snapshot.strip()
         # защита от «ответа вместо правки»: результат должен состоять из слов говорящего
         why = _not_an_edit(src, cleaned)
         if why:
             log.warning("правка отброшена (%s): %r -> %r", why, src, cleaned)
-            return
+            return False
         if not self.tail.startswith(snapshot):
-            return
+            return False
         if not self.can_edit():
             log.info("правка остановлена: пользователь работает с окном")
             self._freeze_all()
             self.cleanup = None
-            return
+            return False
         lead = snapshot[:len(snapshot) - len(snapshot.lstrip())]
+        eat = 0
+        if join and cleaned[:1] in JOIN_PUNCT:
+            # знак, которого не хватало прошлому предложению, — вплотную к нему: пробелы перед ним стираем
+            lead, eat = "", self.pre_ws
         new_part = lead + cleaned
         new_tail = new_part + self.tail[len(snapshot):]
         p = 0
-        while p < min(len(self.tail), len(new_tail)) and self.tail[p] == new_tail[p]:
+        while not eat and p < min(len(self.tail), len(new_tail)) and self.tail[p] == new_tail[p]:
             p += 1
-        if p < len(self.tail) or p < len(new_tail):
-            w.type_text(new_tail[p:], backspaces=len(self.tail) - p)
+        if p < len(self.tail) or p < len(new_tail) or eat:
+            w.type_text(new_tail[p:], backspaces=len(self.tail) - p + eat)
             log.info("правка (%.2fs): %r -> %r", dt, src, cleaned)
+        if eat:
+            self.before = self.before.rstrip(" \t")
+            self.pre_ws = 0
         self.tail = new_tail
         self.checked += len(new_part) - len(snapshot)
         self._freeze_old(len(new_part))
+        return True
 
     def _freeze_old(self, cleaned_len):
         """Старые предложения в уже вычищенной части больше не трогаем."""
@@ -383,3 +448,55 @@ def _sentence_cut(text):
     for m in re.finditer(r"[.!?…]+(?=\s)", text):
         pass
     return m.end() if m else 0
+
+
+_TOKEN = re.compile(r"\S+")
+_EDGE = ".,!?…:;—–-«»\"'()“”„"
+
+
+def _norm_token(t):
+    return t.strip(_EDGE).lower().replace("ё", "е")
+
+
+def open_sentence(before):
+    """Недоговорённое предложение в конце текста перед курсором (после последнего знака конца
+    предложения или переноса строки), если оно знаком конца не кончается; иначе ''."""
+    s = before.rstrip(" \t")
+    core = s.rstrip("»\"'”)]")
+    if not core or core[-1] in ".!?…\n":
+        return ""
+    start = 0
+    for m in re.finditer(r"[.!?…]+[»\"'”)\]]*\s+|\n", s):
+        start = m.end()
+    sent = s[start:]
+    if len(sent) > JOIN_MAX_CHARS:
+        sent = sent[-JOIN_MAX_CHARS:].split(" ", 1)[-1]
+    return sent if re.search(r"\w", sent) else ""
+
+
+def _split_join(head, frag, res):
+    """res — правка текста «head frag», где head уже на экране и его не трогаем. Вернуть правку frag:
+    со знака, которого не хватало в конце head (". Дальше…"), или с маленькой буквы, если frag
+    продолжает предложение; None — если не понять, где в res кончается head."""
+    src = [(_norm_token(t), 0) for t in head.split()] + [(_norm_token(t), 1) for t in frag.split()]
+    toks = list(_TOKEN.finditer(res))
+    sm = difflib.SequenceMatcher(None, [x for x, _ in src], [_norm_token(m.group()) for m in toks],
+                                 autojunk=False)
+    origin = [None] * len(toks)   # откуда слово res: 0 — из head, 1 — из frag, None — новое
+    for b in sm.get_matching_blocks():
+        for k in range(b.size):
+            origin[b.b + k] = src[b.a + k][1]
+    first = next((i for i, o in enumerate(origin) if o == 1), None)
+    if first is None or 0 not in origin[:first] or 0 in origin[first:]:
+        return None
+    last = max(i for i in range(first) if origin[i] == 0)
+    hw, rw = head.split()[-1], toks[last].group()
+    head_tail = hw[len(hw.rstrip(_EDGE)):]
+    res_tail = (rw[len(rw.rstrip(_EDGE)):] + res[toks[last].end():toks[first].start()]).replace(" ", "")
+    if not res_tail.startswith(head_tail):
+        return None   # модель поменяла знак, который уже стоит на экране, — так не умеем
+    add = res_tail[len(head_tail):]
+    if any(c not in JOIN_PUNCT + "—–-" for c in add):
+        return None
+    rest = res[toks[first].start():]
+    return (add + " " + rest) if add else rest

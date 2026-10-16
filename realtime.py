@@ -57,6 +57,7 @@ class RealtimeSession:
         self.finishing = False
         self.cleanup = None                # задаёт App: функция правки текста или None
         self.can_edit = lambda: True
+        self.prior = None                  # задаёт App: () -> текст перед курсором
         self.on_usage = None               # задаёт App: учёт расхода, вызывается с usage сегмента
         self.usage_seen = False
 
@@ -194,7 +195,7 @@ class RealtimeSession:
     def begin(self, get_mode, emit, translate, on_done):
         self.started = True
         self.get_mode, self.emit, self.translate, self.on_done = get_mode, emit, translate, on_done
-        self.live = LiveText(self.cleanup, self.can_edit)
+        self.live = LiveText(self.cleanup, self.can_edit, self.prior)
         threading.Thread(target=self._sender, daemon=True, name="rt-send").start()
         threading.Thread(target=self._output, daemon=True, name="rt-out").start()
 
@@ -290,8 +291,8 @@ class RealtimeSession:
                     chunk = chunk.lstrip()
                     if chunk:
                         it["started"] = True
-                        if typed_any and chunk[0] not in CLAUSE_END:
-                            chunk = " " + chunk
+                        if chunk[0] not in CLAUSE_END:
+                            chunk = self.live.lead() + chunk
                 if chunk:
                     self.live.append(chunk, item_done, editable=not en)
                     typed_any = True
