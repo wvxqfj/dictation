@@ -95,6 +95,10 @@ CAPTURE_TIMEOUT = 10      # сколько окно настроек ждёт н
 REWRITE_TIMEOUT = 30      # сколько ждать OpenAI при переписывании выделенного текста
 PRIOR_WAIT = 0.4          # сколько первая фраза ждёт текста перед курсором от UI Automation
 VK_ESCAPE = 0x1B
+SELECTION_POLL = 0.4      # как часто открытое меню/перевод проверяет, на месте ли выделение
+SCROLL_PX = 30            # выделение сдвинулось на экране дальше — текст прокрутили, плашка не к месту
+HOOK_CHECK = 5            # как часто проверять, жив ли хук мыши (Windows может молча его снять)
+WM_REHOOK = 0x8000 + 7    # главному потоку: переустановить хук мыши
 
 log = logging.getLogger("dictation")
 
@@ -418,6 +422,7 @@ class App:
 
         def mouse_proc(n_code, w_param, l_param):
             if n_code == 0 and w_param in (w.WM_LBUTTONDOWN, w.WM_RBUTTONDOWN, w.WM_MBUTTONDOWN):
+                self.mouse_seen = time.time()
                 ms = ctypes.cast(l_param, ctypes.POINTER(w.MSLLHOOKSTRUCT)).contents
                 if not ms.flags & w.LLMHF_INJECTED:
                     self.user_input_at = time.time()
@@ -432,8 +437,30 @@ class App:
         if not self.hook:
             raise ctypes.WinError(ctypes.get_last_error())
         self._mouse_proc = w.HOOKPROC(mouse_proc)
+        self.mouse_seen = time.time()
         self.mouse_hook = w.user32.SetWindowsHookExW(w.WH_MOUSE_LL, self._mouse_proc,
                                                      w.kernel32.GetModuleHandleW(None), 0)
+
+    def reinstall_mouse_hook(self):
+        """В главном потоке: Windows молча снимает хук, если тот однажды не ответил вовремя."""
+        if self.mouse_hook:
+            w.user32.UnhookWindowsHookEx(self.mouse_hook)
+        self.mouse_seen = time.time()
+        self.mouse_hook = w.user32.SetWindowsHookExW(w.WH_MOUSE_LL, self._mouse_proc,
+                                                     w.kernel32.GetModuleHandleW(None), 0)
+
+    def hook_keeper(self):
+        """Курсор двигался, а хук мыши ничего не получил — значит, его сняли: ставим заново."""
+        last = None
+        while True:
+            time.sleep(HOOK_CHECK)
+            pt = wt.POINT()
+            w.user32.GetCursorPos(ctypes.byref(pt))
+            pos = (pt.x, pt.y)
+            if last is not None and pos != last and time.time() - self.mouse_seen > HOOK_CHECK:
+                log.warning("хук мыши не получает событий — переустанавливаю")
+                w.user32.PostThreadMessageW(self.main_tid, WM_REHOOK, 0, 0)
+            last = pos
 
     # --- контроллер
 
@@ -949,6 +976,7 @@ class App:
         self.rewrite_job = job
         job["token"] = self.menu.show(info and info.get("rect"), hwnd)
         log.info("меню переписывания: выделено %d знаков", len(text))
+        self.watch_selection(self.menu, job["token"], info)
 
     def on_rewrite_pick(self, token, kind):
         threading.Thread(target=self.do_rewrite, args=(token, kind), daemon=True).start()
@@ -980,6 +1008,33 @@ class App:
         self.last_typed = None
         log.info("переписано (%s) за %.1fs: %d -> %d знаков", rewrite.LABELS[kind], time.time() - t_pick,
                  len(src), len(out))
+
+    def watch_selection(self, popup, token, info):
+        """Меню или перевод сами закрываются, когда стали не к месту: выделение сняли, выделили другое
+        или текст прокрутили (выделение уехало). Следим через UI Automation, если выделение пришло оттуда."""
+        if not info or not (info.get("selection") or "").strip():
+            return
+        norm = lambda t: " ".join((t or "").split())
+        sel, rect = norm(info["selection"]), info.get("rect")
+
+        def loop():
+            while True:
+                time.sleep(SELECTION_POLL)
+                if not popup.active(token):
+                    return
+                now = self.uia.caret()(1.0)
+                if now is None or not popup.active(token):
+                    continue   # UI Automation сейчас не ответила — не повод закрывать
+                why = None
+                if norm(now["selection"]) != sel:
+                    why = "выделение сняли или изменили"
+                elif rect and now.get("rect") and max(abs(a - b) for a, b in zip(rect, now["rect"])) > SCROLL_PX:
+                    why = "текст прокрутили"
+                if why:
+                    log.info("%s закрыт: %s", popup.CLASS, why)
+                    popup.hide(token)
+                    return
+        threading.Thread(target=loop, daemon=True, name="watch-selection").start()
 
     def own_window(self, hwnd):
         return hwnd in (self.menu.hwnd, self.bubble.hwnd)
@@ -1017,6 +1072,7 @@ class App:
             return
         token = self.bubble.show(info and info.get("rect"), hwnd)
         log.info("перевод выделенного: %d знаков", len(text))
+        self.watch_selection(self.bubble, token, info)
         t1 = time.time()
         try:
             out = self.translate_selection(text)
@@ -1127,6 +1183,7 @@ class App:
         threading.Thread(target=self.run_tray, daemon=True).start()
         threading.Thread(target=self.spare_keeper, daemon=True).start()
         threading.Thread(target=self.llm_keeper, daemon=True).start()
+        threading.Thread(target=self.hook_keeper, daemon=True).start()
         if self.key and not self.local:
             threading.Thread(target=self.refill_spare, daemon=True).start()
         if self.cfg["keep_mic_open"]:
@@ -1141,6 +1198,9 @@ class App:
             self.notify("Нет OpenAI API ключа — впишите его в config.json и перезапустите")
         msg = wt.MSG()
         while w.user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_REHOOK and not msg.hWnd:
+                self.reinstall_mouse_hook()
+                continue
             w.user32.TranslateMessage(ctypes.byref(msg))
             w.user32.DispatchMessageW(ctypes.byref(msg))
         w.user32.UnhookWindowsHookEx(self.hook)

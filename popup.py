@@ -29,6 +29,7 @@ IDC_ARROW, IDC_HAND = 32512, 32649
 ULW_ALPHA = 2
 HWND_TOPMOST = ctypes.c_void_p(-1)
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+MOUSE_BUTTONS = (0x01, 0x02, 0x04)   # левая, правая, средняя
 
 # логические размеры (умножаются на DPI-масштаб)
 SHADOW = 14           # поле под тень
@@ -108,6 +109,7 @@ class Popup:
         self.hover = self.pressed = None
         self.shown_at = self.painted = 0.0
         self.alpha = 0.0
+        self.was_down = False
         self.tracking = False
         self.layout = None
         self.base = None
@@ -301,6 +303,7 @@ class Popup:
         self._place()
         self.alpha = 0.0
         self.shown_at = time.time()
+        self.was_down = self._buttons_down()   # кнопку, зажатую ещё до показа, за щелчок мимо не считаем
         self._paint()
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
@@ -330,10 +333,18 @@ class Popup:
         self.pos = (x, y)
         self.rect = (x + sh, y + sh, x + W - sh, y + H - sh)
 
+    def _buttons_down(self):
+        return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in MOUSE_BUTTONS)
+
     def _tick(self):
         if not self.visible:
             return
-        if user32.GetForegroundWindow() != self.target or (
+        # щелчок мимо плашки её закрывает. Кнопки мыши опрашиваем сами, не полагаясь на глобальный хук:
+        # его Windows может молча снять, а щелчки тачпадом он видит не всегда
+        down = self._buttons_down()
+        outside = down and not self.was_down and not self.contains(*cursor_pos())
+        self.was_down = down
+        if outside or user32.GetForegroundWindow() != self.target or (
                 self.IDLE_HIDE and not self._animating() and time.time() - self.shown_at > self.IDLE_HIDE):
             self.visible = False
             self._send("hide", None)
