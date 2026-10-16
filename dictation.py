@@ -4,6 +4,7 @@
   Copilot (держать)                     -> диктовка на языке речи, текст печатается по ходу
   Copilot коротко, затем сразу держать  -> диктовка с переводом на английский
   Copilot коротко (текст выделен)       -> меню: переписать выделенное короче / длиннее / официальнее…
+  Copilot дважды коротко (текст выделен) -> перевод выделенного на русский (русский — на английский)
 
 Клавиша Copilot на Windows 11 отправляет Win+Shift+F23, поэтому перехватываем F23.
 Другую клавишу можно назначить в окне настроек (hotkey_vk).
@@ -46,6 +47,7 @@ import rewrite_menu
 import settings_window
 import stats
 import text_context
+import translate_popup
 from realtime import SAMPLE_RATE as OPENAI_RATE, RealtimeSession, is_live
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -301,6 +303,8 @@ class App:
         self.ui = None
         self.uia = text_context.Uia()
         self.menu = rewrite_menu.RewriteMenu(self.on_rewrite_pick)
+        self.bubble = translate_popup.TranslateBubble(self.copy_translation)
+        self.popups = (self.menu, self.bubble)
         self.rewrite_job = None
         self.last_typed = None        # что напечатала прошлая диктовка: окно, хвост текста и когда
 
@@ -314,6 +318,7 @@ class App:
         self.capture = None           # окно настроек ловит новую клавишу диктовки
         # тап или удержание (меняется только в потоке-контроллере)
         self.pending_press = None   # нажатие, которое ещё может оказаться тапом
+        self.pending_mode = "native"   # чем станет это нажатие, если его удержать: второе подряд — английский
         self.last_tap_up = 0.0
         self.user_input_at = 0.0   # последний клик/нажатие пользователя (для живой правки)
 
@@ -366,10 +371,10 @@ class App:
         if vk != hot:
             if down:
                 self.user_input_at = time.time()
-                if self.menu.visible and not (hot == w.VK_COPILOT and vk in COPILOT_MODS):
-                    # любая клавиша закрывает меню переписывания; Esc при этом до окна не доходит.
-                    # Win/Shift не в счёт: клавиша Copilot шлёт их перед F23 — её нажатие закроет меню само
-                    self.menu.hide()
+                if self.popup_open() and not (hot == w.VK_COPILOT and vk in COPILOT_MODS):
+                    # любая клавиша закрывает меню переписывания и перевод; Esc при этом до окна не доходит.
+                    # Win/Shift не в счёт: клавиша Copilot шлёт их перед F23 — её нажатие закроет всё само
+                    self.hide_popups()
                     if vk == VK_ESCAPE:
                         self.esc_swallowed = True
                         return True
@@ -382,8 +387,8 @@ class App:
             self.key_down = True
             self.press_id += 1
             self.trace = ["F+"]
-            if self.menu.visible:
-                self.menu.hide()
+            if self.popup_open():
+                self.hide_popups()
                 self.tap_ignore = self.press_id
             self.events.put(("press", self.press_id, time.time()))
             if hot == w.VK_COPILOT:
@@ -416,8 +421,9 @@ class App:
                 ms = ctypes.cast(l_param, ctypes.POINTER(w.MSLLHOOKSTRUCT)).contents
                 if not ms.flags & w.LLMHF_INJECTED:
                     self.user_input_at = time.time()
-                    if self.menu.visible and not self.menu.contains(ms.pt.x, ms.pt.y):
-                        self.menu.hide()   # щелчок мимо меню переписывания закрывает его
+                    for p in self.popups:
+                        if p.visible and not p.contains(ms.pt.x, ms.pt.y):
+                            p.hide()   # щелчок мимо меню переписывания или перевода закрывает его
             return w.user32.CallNextHookEx(None, n_code, w_param, l_param)
 
         self._proc = w.HOOKPROC(proc)  # держим ссылку, иначе GC
@@ -441,7 +447,7 @@ class App:
                 elif kind == "hold":
                     if self.pending_press == ev[1]:
                         self.pending_press = None
-                        self.start_recording("native")
+                        self.start_recording(self.pending_mode)
                 elif kind == "up":
                     self.on_up(ev[1], ev[2])
                 elif kind == "tap":
@@ -480,23 +486,37 @@ class App:
         return held
 
     def on_press(self, pid, t):
-        if t - self.last_tap_up < TAP_GAP:
-            # тап, затем удержание — английский
+        # второе нажатие сразу после тапа: удержание — диктовка на английский, ещё тап — перевод выделенного
+        second = t - self.last_tap_up < TAP_GAP
+        if second:
             self.last_tap_up = 0.0
-            self.start_recording("en")
-            return
         # ждём HOLD_DELAY: отпустили раньше — это тап. Начало речи не теряется, его хранит preroll
         self.pending_press = pid
+        self.pending_mode = "en" if second else "native"
         threading.Timer(HOLD_DELAY, lambda: self.events.put(("hold", pid))).start()
 
     def on_up(self, pid, t):
         if self.pending_press == pid:
             self.pending_press = None
+            if self.pending_mode == "en":
+                # двойной тап — перевод выделенного текста
+                if pid != self.tap_ignore and not self.session:
+                    self.release_mods()
+                    threading.Thread(target=self.open_translation, daemon=True).start()
+                return
             self.last_tap_up = t
             if pid != self.tap_ignore:
                 threading.Timer(TAP_GAP, lambda: self.events.put(("tap", t))).start()
         else:
             self.stop_recording()
+
+    def popup_open(self):
+        return any(p.visible for p in self.popups)
+
+    def hide_popups(self):
+        for p in self.popups:
+            if p.visible:
+                p.hide()
 
     def set_backend(self, backend):
         if backend == self.cfg["backend"]:
@@ -910,7 +930,7 @@ class App:
 
     def open_rewrite_menu(self):
         hwnd = w.user32.GetForegroundWindow()
-        if not hwnd or hwnd == self.menu.hwnd or text_context.is_console(hwnd):
+        if not hwnd or self.own_window(hwnd) or text_context.is_console(hwnd):
             return
         t0 = time.time()
         info = self.uia.caret()(1.0)
@@ -961,23 +981,83 @@ class App:
         log.info("переписано (%s) за %.1fs: %d -> %d знаков", rewrite.LABELS[kind], time.time() - t_pick,
                  len(src), len(out))
 
-    def rewrite_text(self, kind, text):
-        """Где переписывать — как с живой правкой: OpenAI, а без интернета (или если так выбрано) — локально."""
+    def own_window(self, hwnd):
+        return hwnd in (self.menu.hwnd, self.bubble.hwnd)
+
+    def chat_engine(self, remote, local):
+        """Где спросить модель — как с живой правкой: OpenAI, а без интернета (или если так выбрано) —
+        локально. remote(client), local(llm) делают сам запрос."""
         engine = self.cfg["cleanup_engine"]
         if self.client and engine != "local" and (engine == "openai" or self.online()):
-            if len(text) > rewrite.MAX_CHARS_REMOTE:
-                raise RuntimeError(f"выделено больше {rewrite.MAX_CHARS_REMOTE} знаков")
             try:
-                return rewrite.remote(
-                    self.client.with_options(timeout=REWRITE_TIMEOUT, max_retries=0), self.cfg["cleanup_model"],
-                    kind, text, on_usage=lambda model, usage: self.stats.chat_usage("rewrite", model, usage))
+                return remote(self.client.with_options(timeout=REWRITE_TIMEOUT, max_retries=0))
             except (openai.APIConnectionError, openai.APITimeoutError) as e:
                 if engine == "openai":
                     raise
                 self.online.lost(e)
-        if len(text) > rewrite.MAX_CHARS_LOCAL:
-            raise RuntimeError(f"локальная модель переписывает до {rewrite.MAX_CHARS_LOCAL} знаков за раз")
-        return rewrite.local(self.ensure_llm(), kind, text)
+        return local(self.ensure_llm())
+
+    # --- перевод выделенного текста
+
+    def open_translation(self):
+        hwnd = w.user32.GetForegroundWindow()
+        if not hwnd or self.own_window(hwnd) or text_context.is_console(hwnd):
+            return
+        t0 = time.time()
+        info = self.uia.caret()(1.0)
+        text = (info or {}).get("selection") or ""
+        if not text.strip():
+            # чужие сообщения и страницы часто не отдают выделение через UI Automation — копируем
+            text = text_context.copy_selection(self.bubble.hwnd) or ""
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            log.info("перевод: ничего не выделено")
+            return
+        if w.user32.GetForegroundWindow() != hwnd or self.user_input_at > t0:
+            return
+        token = self.bubble.show(info and info.get("rect"), hwnd)
+        log.info("перевод выделенного: %d знаков", len(text))
+        t1 = time.time()
+        try:
+            out = self.translate_selection(text)
+        except Exception as e:
+            log.warning("перевод выделенного не удался: %s", e)
+            self.bubble.set_result(token, title="Не удалось перевести", error=str(e))
+            return
+        title = "Перевод на русский" if rewrite.is_russian(out) else "Перевод на английский"
+        self.bubble.set_result(token, out, title)
+        log.info("переведено за %.1fs: %d -> %d знаков", time.time() - t1, len(text), len(out))
+
+    def translate_selection(self, text):
+        model = self.cfg["translate_model"]
+
+        def remote(client):
+            if len(text) > rewrite.MAX_CHARS_REMOTE:
+                raise RuntimeError(f"выделено больше {rewrite.MAX_CHARS_REMOTE} знаков")
+            return rewrite.translate_remote(client, model, text,
+                                            on_usage=lambda m, u: self.stats.chat_usage("translate", m, u))
+
+        def local(llm):
+            if len(text) > rewrite.MAX_CHARS_LOCAL:
+                raise RuntimeError(f"локальная модель переводит до {rewrite.MAX_CHARS_LOCAL} знаков за раз")
+            return rewrite.translate_local(llm, text)
+        return self.chat_engine(remote, local)
+
+    def copy_translation(self, text):
+        text_context.copy_text(self.bubble.hwnd, text)
+
+    def rewrite_text(self, kind, text):
+        def remote(client):
+            if len(text) > rewrite.MAX_CHARS_REMOTE:
+                raise RuntimeError(f"выделено больше {rewrite.MAX_CHARS_REMOTE} знаков")
+            return rewrite.remote(client, self.cfg["cleanup_model"], kind, text,
+                                  on_usage=lambda m, u: self.stats.chat_usage("rewrite", m, u))
+
+        def local(llm):
+            if len(text) > rewrite.MAX_CHARS_LOCAL:
+                raise RuntimeError(f"локальная модель переписывает до {rewrite.MAX_CHARS_LOCAL} знаков за раз")
+            return rewrite.local(llm, kind, text)
+        return self.chat_engine(remote, local)
 
     # --- трей
 
@@ -1009,6 +1089,8 @@ class App:
             pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} коротко + держать — на английский",
                              None, enabled=False),
             pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} коротко — переписать выделенное",
+                             None, enabled=False),
+            pystray.MenuItem(lambda item: f"{w.key_name(self.cfg['hotkey_vk'])} дважды коротко — перевести выделенное",
                              None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda item: f"Локально ({self.cfg['local_model']})",

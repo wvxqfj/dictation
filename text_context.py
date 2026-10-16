@@ -191,15 +191,17 @@ def _save_clipboard(owner):
     return saved
 
 
-def _set_clipboard(owner, items):
-    """Положить в буфер обмена [(формат, байты)]. Пометка Exclude… — чтобы наши временные записи
-    не копились в журнале буфера обмена (Win+V)."""
+def _set_clipboard(owner, items, private=True):
+    """Положить в буфер обмена [(формат, байты)]. Пометка Exclude… (private) — чтобы наши временные
+    записи не копились в журнале буфера обмена (Win+V)."""
     if not _open_clipboard(owner):
         return False
     try:
         user32.EmptyClipboard()
-        for fmt, data in list(items) + [(user32.RegisterClipboardFormatW(
-                "ExcludeClipboardContentFromMonitorProcessing"), b"\0")]:
+        if private:
+            items = list(items) + [(user32.RegisterClipboardFormatW(
+                "ExcludeClipboardContentFromMonitorProcessing"), b"\0")]
+        for fmt, data in items:
             h = kernel32.GlobalAlloc(GMEM_MOVEABLE, max(1, len(data)))
             p = kernel32.GlobalLock(h)
             ctypes.memmove(p, data, len(data))
@@ -261,12 +263,21 @@ def copy_selection(owner, timeout=0.6):
         _set_clipboard(owner, saved)
 
 
+def _unicode(text):
+    return text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-16-le") + b"\0\0"
+
+
+def copy_text(owner, text):
+    """Скопировать текст в буфер обмена, как обычное Ctrl+C."""
+    if not _set_clipboard(owner, [(CF_UNICODETEXT, _unicode(text))], private=False):
+        raise RuntimeError("буфер обмена занят")
+
+
 def paste_text(owner, text, settle=0.6):
     """Вставить текст в активное окно через буфер обмена (Ctrl+V) и вернуть прежний буфер.
     Так переносы строк сохраняются, а замена — один шаг отмены (Ctrl+Z)."""
     saved = _save_clipboard(owner)
-    data = text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-16-le") + b"\0\0"
-    if not _set_clipboard(owner, [(CF_UNICODETEXT, data)]):
+    if not _set_clipboard(owner, [(CF_UNICODETEXT, _unicode(text))]):
         raise RuntimeError("буфер обмена занят")
     _combo(VK_V)
     time.sleep(settle)   # приложение читает буфер не сразу — возвращаем прежний, когда оно уже вставило
