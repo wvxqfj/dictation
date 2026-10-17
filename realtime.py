@@ -8,6 +8,8 @@ import time
 
 import websocket
 
+import vocab
+
 from live_edit import LiveText
 
 log = logging.getLogger("dictation")
@@ -71,8 +73,9 @@ class RealtimeSession:
         if self.cfg.get("language"):
             tr["languages" if is_live(model) else "language"] = (
                 [self.cfg["language"]] if is_live(model) else self.cfg["language"])
-        if self.cfg.get("transcribe_prompt"):
-            tr["prompt"] = self.cfg["transcribe_prompt"]
+        prompt = vocab.transcribe_prompt(self.cfg.get("transcribe_prompt"))
+        if prompt:
+            tr["prompt"] = prompt
         if is_live(model):
             tr["delay"] = self.cfg.get("live_delay") or "low"
             turn = None

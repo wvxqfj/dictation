@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 
+import vocab
 from live_edit import LiveText
 from realtime import CLAUSE_END, EN_MAX_WORDS, EN_MIN_WORDS, SENTENCE_END, _translate_piece_impl
 
@@ -215,7 +216,7 @@ class LocalSession:
 
     def _interim(self, audio):
         t0 = time.time()
-        words = self.engine.transcribe(audio).split()
+        words = vocab.fix(self.engine.transcribe(audio)).split()
         dt = time.time() - t0
         log.debug("interim %.1fs за %.2fs: %s", len(audio) / SAMPLE_RATE, dt, " ".join(words))
         # знаки препинания и регистр модель на обрывке фразы ставит наугад — сравниваем без них
@@ -331,7 +332,7 @@ class LocalSession:
         if len(audio) < SAMPLE_RATE // 4 and not shown:
             return
         t0 = time.time()
-        text = self.engine.transcribe(audio)
+        text = vocab.fix(self.engine.transcribe(audio))
         log.info("фраза %.1fs распознана за %.2fs", len(audio) / SAMPLE_RATE, time.time() - t0)
         if self.retranslate:
             if text or shown:

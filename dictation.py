@@ -48,6 +48,7 @@ import settings_window
 import stats
 import text_context
 import translate_popup
+import vocab
 from realtime import SAMPLE_RATE as OPENAI_RATE, RealtimeSession, is_live
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +71,7 @@ DEFAULT_CONFIG = {
     "translate_model": "gpt-4.1-mini",
     "language": "",
     "transcribe_prompt": "",
+    "vocabulary": "",          # свои термины: «Lolz = лолз, лоуз; Avito = авито» (см. vocab.py)
     "vad_silence_ms": 500,
     "noise_reduction": "near_field",
     "keep_mic_open": True,
@@ -131,7 +133,7 @@ def save_config_values(values):
 # что нельзя поменять на лету — нужен перезапуск
 RESTART_KEYS = ("local_model", "local_quantization")
 # что влияет на подключение к Realtime API — заранее открытое соединение пересоздаём
-REALTIME_KEYS = ("transcribe_model", "live_delay", "language", "transcribe_prompt", "vad_silence_ms",
+REALTIME_KEYS = ("transcribe_model", "live_delay", "language", "transcribe_prompt", "vocabulary", "vad_silence_ms",
                  "noise_reduction", "openai_api_key")
 REST_MODEL = "gpt-4o-transcribe"   # для отката: потоковые модели работают только через Realtime
 
@@ -285,6 +287,7 @@ def resampler(sink, src_rate, dst_rate):
 class App:
     def __init__(self, cfg):
         self.cfg = cfg
+        vocab.configure(cfg["vocabulary"])
         self.key = cfg["openai_api_key"] or os.environ.get("OPENAI_API_KEY", "")
         self.client = OpenAI(api_key=self.key) if self.key else None
         self.local = cfg["backend"] == "local"
@@ -690,6 +693,8 @@ class App:
         if "openai_api_key" in clean:
             self.key = self.cfg["openai_api_key"] or os.environ.get("OPENAI_API_KEY", "")
             self.client = OpenAI(api_key=self.key) if self.key else None
+        if "vocabulary" in clean:
+            vocab.configure(self.cfg["vocabulary"])
         if "translate_engine" in clean:
             self.init_translator()
         if any(k in clean for k in ("cleanup", "cleanup_engine", "local_cleanup_model", "openai_api_key")):
@@ -883,11 +888,14 @@ class App:
         kwargs = {}
         if self.cfg["language"]:
             kwargs["language"] = self.cfg["language"]
+        prompt = vocab.transcribe_prompt(self.cfg["transcribe_prompt"])
+        if prompt:
+            kwargs["prompt"] = prompt
         model = REST_MODEL if is_live(self.cfg["transcribe_model"]) else self.cfg["transcribe_model"]
         resp = self.client.audio.transcriptions.create(
             model=model, file=("speech.wav", buf.getvalue(), "audio/wav"), **kwargs)
         self.stats.transcribe_seconds(model, len(pcm) / 2 / OPENAI_RATE)
-        text = (resp.text or "").strip()
+        text = vocab.fix((resp.text or "").strip())
         if text and mode == "en":
             try:
                 text = self.translate(text)

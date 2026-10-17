@@ -723,6 +723,9 @@ class SettingsWindow:
         self._field(sec, "language", "Язык", "choice", group="openai")
         self._field(sec, "transcribe_prompt", "Подсказка для распознавания", "text", group="openai",
                     hint="Термины, имена, названия, которые модель должна писать правильно.")
+        self._field(sec, "vocabulary", "Мои слова", "text",
+                    hint="Как писать термины, которые модель коверкает. Через «;»: «Avito = авито; Proxyline = "
+                         "проксилайн, прокси лайн». Lolz, API, AI, OpenAI, Claude Code, GitHub и др. уже в словаре.")
         self._field(sec, "noise_reduction", "Шумоподавление", "choice", group="openai")
         self._field(sec, "vad_silence_ms", "Пауза — конец фразы", "slider",
                     hint="Для локальной модели и gpt-4o-transcribe. Меньше — текст появляется быстрее, "

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 
+import vocab
 import winapi as w
 
 log = logging.getLogger("dictation")
@@ -128,7 +129,7 @@ def make_local_cleanup(llm):
             if c and res.startswith(c):
                 res = res[len(c):].strip()   # модель всё же повторила контекст
                 break
-        res = strip_fillers(res)
+        res = vocab.fix(strip_fillers(res))
         if res and fragment[:1].islower() and context and context.rstrip()[-1:] not in ".!?…":
             res = res[0].lower() + res[1:]  # продолжение предложения — без заглавной
         return res
@@ -140,11 +141,11 @@ def make_cleanup(client, model, on_usage=None):
         user = (f"КОНТЕКСТ:\n{context}\n\n" if context else "КОНТЕКСТ: (начало текста)\n\n")
         resp = client.chat.completions.create(
             model=model, temperature=0,
-            messages=[{"role": "system", "content": PROMPT},
+            messages=[{"role": "system", "content": PROMPT + vocab.cleanup_hint()},
                       {"role": "user", "content": user + f"ФРАГМЕНТ:\n{fragment}"}])
         if on_usage:
             on_usage(model, resp.usage)
-        return (resp.choices[0].message.content or "").strip().strip("«»\"'")
+        return vocab.fix((resp.choices[0].message.content or "").strip().strip("«»\"'"))
     return cleanup
 
 
@@ -426,7 +427,7 @@ def _not_an_edit(src, cleaned):
     Правка только убирает слова (паразиты, оговорки), чинит пунктуацию и отдельные слова."""
     if not cleaned:
         return "пусто"
-    a, b = _words(src), _words(cleaned)
+    a, b = _words(vocab.fix(src)), _words(cleaned)   # «апи» → «API» — не новое слово
     if not a:
         return ""
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
